@@ -1,13 +1,10 @@
 import os
 import logging
 import streamlit as st
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import PyMuPDFLoader
 from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
-from sentence_transformers import SentenceTransformer
-from langchain_openai import ChatOpenAI
-from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
+from langchain_openai import OpenAIEmbeddings, ChatOpenAI
 
 # -------------------- Logging --------------------
 logging.basicConfig(
@@ -25,102 +22,95 @@ def is_disallowed(query: str) -> bool:
 
 # -------------------- Document Ingestion --------------------
 def load_and_embed(pdf_file):
-    loader = PyPDFLoader(pdf_file)
+    loader = PyMuPDFLoader(pdf_file)
     documents = loader.load()
 
+    # Split document into chunks
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
     docs = text_splitter.split_documents(documents)
 
-    # Free embeddings with SentenceTransformers
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    embeddings = [embedder.encode(doc.page_content) for doc in docs]
+    # Embeddings
+    embeddings = OpenAIEmbeddings(openai_api_key=os.getenv("OPENAI_API_KEY"))
 
     # Store in FAISS
-    vectorstore = FAISS.from_embeddings([(docs[i], embeddings[i]) for i in range(len(docs))], embedder)
+    vectorstore = FAISS.from_documents(docs, embeddings)
     return vectorstore
-
-# -------------------- QA Chain --------------------
-def build_qa_chain(vectorstore):
-    llm = ChatOpenAI(
-        model="gpt-4o-mini",  # Change model here if needed
-        temperature=0,
-        openai_api_key=os.getenv("OPENAI_API_KEY")
-    )
-
-    prompt_template = """
-    You are a strict assistant that answers ONLY based on the provided context.
-    If the answer is not present in the context, respond with:
-    "This question is outside the scope of my knowledge base."
-
-    Context: {context}
-    Question: {question}
-
-    Answer strictly from the context:
-    """
-
-    prompt = PromptTemplate(
-        input_variables=["context", "question"],
-        template=prompt_template,
-    )
-
-    return RetrievalQA.from_chain_type(
-        llm=llm,
-        retriever=vectorstore.as_retriever(search_kwargs={"k": 3}),
-        chain_type="stuff",
-        chain_type_kwargs={"prompt": prompt},
-        return_source_documents=False
-    )
 
 # -------------------- Streamlit App --------------------
 def main():
-    st.set_page_config(page_title="🏥 HCL Healthcare Sales Chatbot", layout="wide")
-
+    st.set_page_config(page_title="Corporate Healthcare Sales Chatbot", layout="wide")
     st.markdown(
-        "<h1 style='text-align: center; color: #0047AB;'>🏥 HCL Healthcare Sales Chatbot</h1>",
+        "<h1 style='color:#0047AB;'>🏥 Corporate Healthcare Sales Chatbot</h1>",
         unsafe_allow_html=True
     )
 
-    # Upload section
-    uploaded_file = st.file_uploader("📄 Upload a PDF document", type="pdf")
-
+    # Session State
     if "chat_history" not in st.session_state:
         st.session_state.chat_history = []
+    if "vectorstore" not in st.session_state:
+        st.session_state.vectorstore = None
 
+    # File Upload
+    uploaded_file = st.file_uploader("📂 Upload a PDF", type="pdf")
     if uploaded_file:
         with open("temp.pdf", "wb") as f:
             f.write(uploaded_file.getbuffer())
+        st.session_state.vectorstore = load_and_embed("temp.pdf")
+        st.success("✅ Document uploaded, chunked, embedded and indexed successfully!")
 
-        vectorstore = load_and_embed("temp.pdf")
-        qa_chain = build_qa_chain(vectorstore)
+    # Reset Conversation
+    if st.button("🔄 Reset Conversation"):
+        st.session_state.chat_history = []
+        st.session_state.vectorstore = None
+        st.success("Conversation reset!")
 
-        st.success("✅ Document uploaded, chunked, embedded, and indexed successfully!")
+    # Chat UI
+    query = st.text_input("💬 Ask a question about the document:")
+    if query:
+        if is_disallowed(query):
+            response = "🚫 This question is outside the scope of my knowledge base."
+        elif not st.session_state.vectorstore:
+            response = "⚠️ Please upload a document first."
+        else:
+            # Retrieve relevant chunks
+            retriever = st.session_state.vectorstore.as_retriever(search_kwargs={"k": 3})
+            relevant_docs = retriever.get_relevant_documents(query)
+            context = "\n\n".join([doc.page_content for doc in relevant_docs])
 
-        query = st.text_input("💬 Ask a question about the document:")
-        if st.button("Send"):
-            if query:
-                if is_disallowed(query):
-                    response = "🚫 This question is outside the scope of my knowledge base."
-                else:
-                    result = qa_chain.invoke({"query": query})
-                    response = result["result"]
+            # Build prompt
+            prompt = f"""
+            You are a strict assistant that ONLY answers using the provided context.
+            If the answer is not in the context, say:
+            "This question is outside the scope of my knowledge base."
 
-                # Log query + response
-                logging.info(f"Query: {query}")
-                logging.info(f"Response: {response}")
+            Context: {context}
+            Question: {query}
 
-                # Save to history
-                st.session_state.chat_history.append((query, response))
+            Answer strictly from the context:
+            """
 
-        # Chat history display
-        st.markdown("### 🗂 Chat History")
-        for q, r in st.session_state.chat_history:
-            st.markdown(f"**You:** {q}")
-            st.markdown(f"**Bot:** {r}")
+            llm = ChatOpenAI(
+                model="gpt-4o-mini",  # free/cheaper tier model
+                temperature=0,
+                openai_api_key=os.getenv("OPENAI_API_KEY")
+            )
 
-        # Reset conversation
-        if st.button("🔄 Reset Conversation"):
-            st.session_state.chat_history = []
-            st.success("Conversation reset!")
+            response = llm.predict(prompt)
+
+        # Save to chat history
+        st.session_state.chat_history.append((query, response))
+
+        # Log query + response
+        logging.info(f"Query: {query}")
+        logging.info(f"Response: {response}")
+
+    # Display chat history
+    if st.session_state.chat_history:
+        st.subheader("📝 Chat History")
+        for i, (q, r) in enumerate(st.session_state.chat_history, 1):
+            st.markdown(f"**Q{i}:** {q}")
+            st.markdown(f"<span style='color:#0047AB;'>**A{i}:** {r}</span>", unsafe_allow_html=True)
+            st.markdown("---")
 
 if __name__ == "__main__":
     main()
