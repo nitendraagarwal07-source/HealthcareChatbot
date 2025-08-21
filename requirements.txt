@@ -1,8 +1,12 @@
 streamlit
 langchain
 langchain-community
-langchain-openai
 faiss-cpu
 pymupdf
-openai
+sentence-transformers
+transformers
+accelerate
+sentencepiece
+torch
+
 
